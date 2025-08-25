@@ -84,3 +84,99 @@
         paid-at: uint,
     }
 )
+
+;; public functions
+
+;; Deposit funds to the scholarship pool
+(define-public (deposit-funds (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set total-funds (+ (var-get total-funds) amount))
+        (ok amount)
+    )
+)
+
+;; Add a new DAO member
+(define-public (add-dao-member
+        (member principal)
+        (voting-power uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> voting-power u0) ERR-INVALID-AMOUNT)
+        (map-set dao-members member {
+            active: true,
+            voting-power: voting-power,
+            joined-at: stacks-block-height,
+        })
+        (var-set dao-member-count (+ (var-get dao-member-count) u1))
+        (ok true)
+    )
+)
+
+;; Remove a DAO member
+(define-public (remove-dao-member (member principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (match (map-get? dao-members member)
+            member-data (begin
+                (map-set dao-members member (merge member-data { active: false }))
+                (var-set dao-member-count (- (var-get dao-member-count) u1))
+                (ok true)
+            )
+            ERR-NOT-DAO-MEMBER
+        )
+    )
+)
+
+;; Submit scholarship application
+(define-public (submit-application
+        (amount-requested uint)
+        (description (string-utf8 500))
+        (institution (string-utf8 100))
+        (program (string-utf8 100))
+    )
+    (let (
+            (application-id (var-get next-application-id))
+            (voting-deadline (+ stacks-block-height VOTING-DURATION))
+        )
+        (asserts! (> amount-requested u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= amount-requested (var-get total-funds))
+            ERR-INSUFFICIENT-FUNDS
+        )
+        (asserts! (> (len description) u0) ERR-INVALID-APPLICANT)
+        (asserts! (> (len institution) u0) ERR-INVALID-APPLICANT)
+        (asserts! (> (len program) u0) ERR-INVALID-APPLICANT)
+
+        (map-set scholarship-applications application-id {
+            applicant: tx-sender,
+            amount-requested: amount-requested,
+            description: description,
+            institution: institution,
+            program: program,
+            submitted-at: stacks-block-height,
+            voting-deadline: voting-deadline,
+            status: STATUS-PENDING,
+            total-votes-for: u0,
+            total-votes-against: u0,
+            voters: (list),
+        })
+
+        (var-set next-application-id (+ application-id u1))
+        (ok application-id)
+    )
+)
+
+;; Emergency withdraw (owner only)
+(define-public (emergency-withdraw (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (>= (var-get total-funds) amount) ERR-INSUFFICIENT-FUNDS)
+
+        (try! (as-contract (stx-transfer? amount tx-sender CONTRACT-OWNER)))
+        (var-set total-funds (- (var-get total-funds) amount))
+        (ok amount)
+    )
+)
