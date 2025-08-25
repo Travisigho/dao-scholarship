@@ -180,3 +180,230 @@
         (ok amount)
     )
 )
+
+;; Vote on scholarship application
+(define-public (vote-on-application
+        (application-id uint)
+        (vote-for bool)
+    )
+    (let (
+            (voter tx-sender)
+            (vote-key {
+                application-id: application-id,
+                voter: voter,
+            })
+        )
+        ;; Check if voter is an active DAO member
+        (asserts! (is-some (map-get? dao-members voter)) ERR-NOT-DAO-MEMBER)
+        (asserts! (default-to false (get active (map-get? dao-members voter)))
+            ERR-NOT-DAO-MEMBER
+        )
+
+        (match (map-get? scholarship-applications application-id)
+            app-data (begin
+                (asserts! (< stacks-block-height (get voting-deadline app-data))
+                    ERR-VOTING-PERIOD-ENDED
+                )
+                (asserts! (is-eq (get status app-data) STATUS-PENDING)
+                    ERR-VOTING-PERIOD-ENDED
+                )
+                (asserts! (is-none (map-get? votes vote-key)) ERR-ALREADY-VOTED)
+
+                (let (
+                        (member-voting-power (default-to u0
+                            (get voting-power (map-get? dao-members voter))
+                        ))
+                        (updated-voters (unwrap!
+                            (as-max-len? (append (get voters app-data) voter) u50)
+                            ERR-INVALID-APPLICANT
+                        ))
+                        (new-votes-for (if vote-for
+                            (+ (get total-votes-for app-data) member-voting-power)
+                            (get total-votes-for app-data)
+                        ))
+                        (new-votes-against (if vote-for
+                            (get total-votes-against app-data)
+                            (+ (get total-votes-against app-data)
+                                member-voting-power
+                            )
+                        ))
+                    )
+                    (map-set votes vote-key {
+                        vote: vote-for,
+                        voting-power: member-voting-power,
+                        voted-at: stacks-block-height,
+                    })
+
+                    (map-set scholarship-applications application-id
+                        (merge app-data {
+                            total-votes-for: new-votes-for,
+                            total-votes-against: new-votes-against,
+                            voters: updated-voters,
+                        })
+                    )
+                    (ok true)
+                )
+            )
+            ERR-APPLICATION-NOT-FOUND
+        )
+    )
+)
+
+;; Finalize voting and determine application status
+(define-public (finalize-application (application-id uint))
+    (match (map-get? scholarship-applications application-id)
+        app-data (begin
+            (asserts! (>= stacks-block-height (get voting-deadline app-data))
+                ERR-VOTING-PERIOD-ACTIVE
+            )
+            (asserts! (is-eq (get status app-data) STATUS-PENDING)
+                ERR-VOTING-PERIOD-ENDED
+            )
+
+            (let (
+                    (total-votes (+ (get total-votes-for app-data)
+                        (get total-votes-against app-data)
+                    ))
+                    (total-dao-voting-power (get-total-dao-voting-power))
+                    (quorum-met (>= (* total-votes u100)
+                        (* total-dao-voting-power QUORUM-PERCENTAGE)
+                    ))
+                    (votes-for-percentage (if (> total-votes u0)
+                        (* (get total-votes-for app-data) u100)
+                        u0
+                    ))
+                    (votes-against-percentage (if (> total-votes u0)
+                        (* (get total-votes-against app-data) u100)
+                        u0
+                    ))
+                    (approved (and
+                        quorum-met
+                        (> votes-for-percentage votes-against-percentage)
+                        (>= (get total-votes-for app-data) MIN-VOTE-THRESHOLD)
+                    ))
+                    (new-status (if approved
+                        STATUS-APPROVED
+                        STATUS-REJECTED
+                    ))
+                )
+                (map-set scholarship-applications application-id
+                    (merge app-data { status: new-status })
+                )
+                (ok approved)
+            )
+        )
+        ERR-APPLICATION-NOT-FOUND
+    )
+)
+
+;; Release payout to approved recipient
+(define-public (release-payout (application-id uint))
+    (match (map-get? scholarship-applications application-id)
+        app-data (begin
+            (asserts! (is-eq (get status app-data) STATUS-APPROVED)
+                ERR-NOT-APPROVED
+            )
+            (asserts! (is-none (map-get? payment-records application-id))
+                ERR-ALREADY-PAID
+            )
+            (asserts! (>= (var-get total-funds) (get amount-requested app-data))
+                ERR-INSUFFICIENT-FUNDS
+            )
+
+            (let (
+                    (recipient (get applicant app-data))
+                    (amount (get amount-requested app-data))
+                )
+                (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+                (var-set total-funds (- (var-get total-funds) amount))
+
+                (map-set payment-records application-id {
+                    recipient: recipient,
+                    amount: amount,
+                    paid-at: stacks-block-height,
+                })
+
+                (map-set scholarship-applications application-id
+                    (merge app-data { status: STATUS-PAID })
+                )
+                (ok amount)
+            )
+        )
+        ERR-APPLICATION-NOT-FOUND
+    )
+)
+
+;; read only functions
+
+;; Get application details
+(define-read-only (get-application (application-id uint))
+    (map-get? scholarship-applications application-id)
+)
+
+;; Get DAO member details
+(define-read-only (get-dao-member (member principal))
+    (map-get? dao-members member)
+)
+
+;; Get total funds available
+(define-read-only (get-total-funds)
+    (var-get total-funds)
+)
+
+;; Get next application ID
+(define-read-only (get-next-application-id)
+    (var-get next-application-id)
+)
+
+;; Get DAO member count
+(define-read-only (get-dao-member-count)
+    (var-get dao-member-count)
+)
+
+;; Get vote details
+(define-read-only (get-vote
+        (application-id uint)
+        (voter principal)
+    )
+    (map-get? votes {
+        application-id: application-id,
+        voter: voter,
+    })
+)
+
+;; Get payment record
+(define-read-only (get-payment-record (application-id uint))
+    (map-get? payment-records application-id)
+)
+
+;; Check if voting period is active
+(define-read-only (is-voting-active (application-id uint))
+    (match (map-get? scholarship-applications application-id)
+        app-data (and
+            (< stacks-block-height (get voting-deadline app-data))
+            (is-eq (get status app-data) STATUS-PENDING)
+        )
+        false
+    )
+)
+
+;; Get voting results
+(define-read-only (get-voting-results (application-id uint))
+    (match (map-get? scholarship-applications application-id)
+        app-data (some {
+            total-votes-for: (get total-votes-for app-data),
+            total-votes-against: (get total-votes-against app-data),
+            status: (get status app-data),
+            voting-deadline: (get voting-deadline app-data),
+        })
+        none
+    )
+)
+
+;; private functions
+
+;; Calculate total DAO voting power (simplified implementation)
+(define-private (get-total-dao-voting-power)
+    (* (var-get dao-member-count) u10)
+    ;; Simplified: assume average voting power of 10
+)
